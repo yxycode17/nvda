@@ -1,8 +1,8 @@
 # A part of NonVisual Desktop Access (NVDA)
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
-# Copyright (C) 2006-2024 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Babbage B.V., Bill Dengler,
-# Julien Cochuyt, Derek Riemer, Cyrille Bougot, Leonard de Ruijter, Łukasz Golonka
+# Copyright (C) 2006-2025 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Babbage B.V., Bill Dengler,
+# Julien Cochuyt, Derek Riemer, Cyrille Bougot, Leonard de Ruijter, Łukasz Golonka, Cary-rowen
 
 """High-level functions to speak information."""
 
@@ -26,7 +26,7 @@ import characterProcessing
 import languageHandler
 from textUtils import unicodeNormalize
 from textUtils.uniscribe import splitAtCharacterBoundaries
-from . import manager
+from . import manager, languageHandling
 from .extensions import speechCanceled, post_speechPaused, pre_speechCanceled, pre_speech
 from .extensions import filter_speechSequence
 from .commands import (
@@ -39,6 +39,7 @@ from .commands import (
 	EndUtteranceCommand,
 	SuppressUnicodeNormalizationCommand,
 	CharacterModeCommand,
+	WaveFileCommand,
 )
 from .shortcutKeys import getKeyboardShortcutsSpeech
 
@@ -51,6 +52,7 @@ from .types import (
 	_flattenNestedSequences,
 )
 from typing import (
+	Final,
 	Iterable,
 	Optional,
 	Dict,
@@ -65,9 +67,11 @@ from logHandler import log
 import config
 from config.configFlags import (
 	ReportLineIndentation,
+	ReportSpellingErrors,
 	ReportTableHeaders,
 	ReportCellBorders,
 	OutputMode,
+	TypingEcho,
 )
 import aria
 from .priorities import Spri
@@ -82,6 +86,7 @@ if typing.TYPE_CHECKING:
 
 _speechState: Optional["SpeechState"] = None
 _curWordChars: List[str] = []
+IDEOGRAPHIC_COMMA: Final[str] = "\u3001"
 
 
 class SpeechMode(DisplayStringIntEnum):
@@ -124,6 +129,8 @@ class SpeechState:
 	oldRowSpan = None
 	oldColumnNumber = None
 	oldColumnSpan = None
+	lastReportedLanguage: str | None = None
+	"""The language reported in the last speech sequence"""
 
 
 def getState():
@@ -307,7 +314,7 @@ def spellTextInfo(
 	priority: Optional[Spri] = None,
 ) -> None:
 	"""Spells the text from the given TextInfo, honouring any LangChangeCommand objects it finds if autoLanguageSwitching is enabled."""
-	if not config.conf["speech"]["autoLanguageSwitching"]:
+	if not languageHandling.shouldMakeLangChangeCommand():
 		speakSpelling(info.text, useCharacterDescriptions=useCharacterDescriptions)
 		return
 	curLanguage = None
@@ -483,29 +490,38 @@ def _getSpellingSpeechWithoutCharMode(
 		itemIsNormalized = textIsNormalized
 		uppercase = speakCharAs.isupper()
 		if useCharacterDescriptions and charDesc:
-			IDEOGRAPHIC_COMMA = "\u3001"
-			speakCharAs = charDesc[0] if textLength > 1 else IDEOGRAPHIC_COMMA.join(charDesc)
+			charList = [charDesc[0] if textLength > 1 else IDEOGRAPHIC_COMMA.join(charDesc)]
 		elif useCharacterDescriptions and not charDesc and not fallbackToCharIfNoDescription:
 			return None
 		else:
 			if (symbol := characterProcessing.processSpeechSymbol(locale, speakCharAs)) != speakCharAs:
-				speakCharAs = symbol
+				charList = [symbol]
 			elif not textIsNormalized and unicodeNormalization:
 				if (normalized := unicodeNormalize(speakCharAs)) != speakCharAs:
-					speakCharAs = " ".join(
-						characterProcessing.processSpeechSymbol(locale, normChar) for normChar in normalized
-					)
+					charList = [
+						" ".join(
+							characterProcessing.processSpeechSymbol(locale, normChar)
+							for normChar in normalized
+						),
+					]
 					itemIsNormalized = True
-		if config.conf["speech"]["autoLanguageSwitching"]:
+				else:
+					# Tried to normalize, but it didn't result in normalization at all.
+					# We need to deal with the case where splitAtCharacterBoundaries might have merged characters we need to speak separately.
+					charList = [characterProcessing.processSpeechSymbol(locale, char) for char in speakCharAs]
+			else:
+				charList = [speakCharAs]
+		if languageHandling.shouldMakeLangChangeCommand():
 			yield LangChangeCommand(locale)
-		yield from _getSpellingCharAddCapNotification(
-			speakCharAs,
-			uppercase and sayCapForCapitals,
-			capPitchChange if uppercase else 0,
-			uppercase and beepForCapitals,
-			itemIsNormalized and reportNormalizedForCharacterNavigation,
-		)
-		yield EndUtteranceCommand()
+		for charToSpeak in charList:
+			yield from _getSpellingCharAddCapNotification(
+				charToSpeak,
+				uppercase and sayCapForCapitals,
+				capPitchChange if uppercase else 0,
+				uppercase and beepForCapitals,
+				itemIsNormalized and reportNormalizedForCharacterNavigation,
+			)
+			yield EndUtteranceCommand()
 
 
 def getSingleCharDescriptionDelayMS() -> int:
@@ -780,10 +796,10 @@ def _getPlaceholderSpeechIfTextEmpty(
 	reason: OutputReason,
 ) -> Tuple[bool, SpeechSequence]:
 	"""Attempt to get speech for placeholder attribute if text for 'obj' is empty. Don't report the placeholder
-		value unless the text is empty, because it is confusing to hear the current value (presumably typed by the
-		user) *and* the placeholder. The placeholder should "disappear" once the user types a value.
-	@return: (True, SpeechSequence) if text for obj was considered empty and we attempted to get speech for the
-		placeholder value. (False, []) if text for obj was not considered empty.
+	 value unless the text is empty, because it is confusing to hear the current value (presumably typed by the
+	 user) *and* the placeholder. The placeholder should "disappear" once the user types a value.
+	:return: `(True, SpeechSequence)` if text for obj was considered empty and we attempted to get speech for the
+		placeholder value. `(False, [])` if text for obj was not considered empty.
 	"""
 	textEmpty = obj._isTextEmpty
 	if textEmpty:
@@ -998,8 +1014,11 @@ def splitTextIndentation(text):
 
 RE_INDENTATION_CONVERT = re.compile(r"(?P<char>\s)(?P=char)*", re.UNICODE)
 IDT_BASE_FREQUENCY = 220  # One octave below middle A.
-IDT_TONE_DURATION = 80  # Milleseconds
 IDT_MAX_SPACES = 72
+
+
+def getIndentToneDuration() -> int:
+	return config.conf["documentFormatting"]["indentToneDuration"]
 
 
 def getIndentationSpeech(indentation: str, formatConfig: Dict[str, bool]) -> SpeechSequence:
@@ -1022,7 +1041,7 @@ def getIndentationSpeech(indentation: str, formatConfig: Dict[str, bool]) -> Spe
 	indentSequence: SpeechSequence = []
 	if not indentation:
 		if toneIndentConfig:
-			indentSequence.append(BeepCommand(IDT_BASE_FREQUENCY, IDT_TONE_DURATION))
+			indentSequence.append(BeepCommand(IDT_BASE_FREQUENCY, getIndentToneDuration()))
 		if speechIndentConfig:
 			indentSequence.append(
 				# Translators: This is spoken when the given line has no indentation.
@@ -1052,7 +1071,7 @@ def getIndentationSpeech(indentation: str, formatConfig: Dict[str, bool]) -> Spe
 	if toneIndentConfig:
 		if quarterTones <= IDT_MAX_SPACES:
 			pitch = IDT_BASE_FREQUENCY * 2 ** (quarterTones / 24.0)  # 24 quarter tones per octave.
-			indentSequence.append(BeepCommand(pitch, IDT_TONE_DURATION))
+			indentSequence.append(BeepCommand(pitch, getIndentToneDuration()))
 		else:
 			# we have more than 72 spaces (18 tabs), and must speak it since we don't want to hurt the users ears.
 			speak = True
@@ -1108,9 +1127,6 @@ def speak(  # noqa: C901
 		else:
 			return
 	_speechState.beenCanceled = False
-	# Filter out redundant LangChangeCommand objects
-	# And also fill in default values
-	autoLanguageSwitching = config.conf["speech"]["autoLanguageSwitching"]
 	autoDialectSwitching = config.conf["speech"]["autoDialectSwitching"]
 	curLanguage = defaultLanguage = getCurrentLanguage()
 	prevLanguage = None
@@ -1120,7 +1136,7 @@ def speak(  # noqa: C901
 	speechSequence = []
 	for item in oldSpeechSequence:
 		if isinstance(item, LangChangeCommand):
-			if not autoLanguageSwitching:
+			if not languageHandling.shouldMakeLangChangeCommand():
 				continue
 			curLanguage = item.lang
 			if not curLanguage or (
@@ -1133,7 +1149,7 @@ def speak(  # noqa: C901
 		elif isinstance(item, str):
 			if not item:
 				continue
-			if autoLanguageSwitching and curLanguage != prevLanguage:
+			if languageHandling.shouldMakeLangChangeCommand() and curLanguage != prevLanguage:
 				speechSequence.append(LangChangeCommand(curLanguage))
 				prevLanguage = curLanguage
 			speechSequence.append(item)
@@ -1155,7 +1171,7 @@ def speak(  # noqa: C901
 		item = speechSequence[index]
 		if isinstance(item, CharacterModeCommand):
 			inCharacterMode = item.state
-		if autoLanguageSwitching and isinstance(item, LangChangeCommand):
+		if languageHandling.shouldMakeLangChangeCommand() and isinstance(item, LangChangeCommand):
 			curLanguage = item.lang
 		if isinstance(item, SuppressUnicodeNormalizationCommand):
 			unicodeNormalization = initialUnicodeNormalization and not item.state
@@ -1355,6 +1371,17 @@ PROTECTED_CHAR = "*"
 FIRST_NONCONTROL_CHAR = " "
 
 
+def isFocusEditable() -> bool:
+	"""Check if the currently focused object is editable.
+	:return: ``True`` if the focused object is editable, ``False`` otherwise.
+	"""
+	obj = api.getFocusObject()
+	controls = {controlTypes.ROLE_EDITABLETEXT, controlTypes.ROLE_DOCUMENT, controlTypes.ROLE_TERMINAL}
+	return (
+		obj.role in controls or controlTypes.STATE_EDITABLE in obj.states
+	) and controlTypes.STATE_READONLY not in obj.states
+
+
 def speakTypedCharacters(ch: str):
 	typingIsProtected = api.isTypingProtected()
 	if typingIsProtected:
@@ -1374,8 +1401,12 @@ def speakTypedCharacters(ch: str):
 		clearTypedWordBuffer()
 		if log.isEnabledFor(log.IO):
 			log.io("typed word: %s" % typedWord)
-		if config.conf["keyboard"]["speakTypedWords"] and not typingIsProtected:
-			speakText(typedWord)
+		typingEchoMode = config.conf["keyboard"]["speakTypedWords"]
+		if typingEchoMode != TypingEcho.OFF.value and not typingIsProtected:
+			if typingEchoMode == TypingEcho.ALWAYS.value or (
+				typingEchoMode == TypingEcho.EDIT_CONTROLS.value and isFocusEditable()
+			):
+				speakText(typedWord)
 	if _speechState._suppressSpeakTypedCharactersNumber > 0:
 		# We primarily suppress based on character count and still have characters to suppress.
 		# However, we time out after a short while just in case.
@@ -1387,8 +1418,13 @@ def speakTypedCharacters(ch: str):
 			_speechState._suppressSpeakTypedCharactersTime = None
 	else:
 		suppress = False
-	if not suppress and config.conf["keyboard"]["speakTypedCharacters"] and ch >= FIRST_NONCONTROL_CHAR:
-		speakSpelling(realChar)
+
+	typingEchoMode = config.conf["keyboard"]["speakTypedCharacters"]
+	if not suppress and typingEchoMode != TypingEcho.OFF.value and ch >= FIRST_NONCONTROL_CHAR:
+		if typingEchoMode == TypingEcho.ALWAYS.value or (
+			typingEchoMode == TypingEcho.EDIT_CONTROLS.value and isFocusEditable()
+		):
+			speakSpelling(realChar)
 
 
 class SpeakTextInfoState(object):
@@ -1470,7 +1506,7 @@ def speakTextInfo(
 def getTextInfoSpeech(  # noqa: C901
 	info: textInfos.TextInfo,
 	useCache: Union[bool, SpeakTextInfoState] = True,
-	formatConfig: Dict[str, bool] = None,
+	formatConfig: dict[str, bool | int] | None = None,
 	unit: Optional[str] = None,
 	reason: OutputReason = OutputReason.QUERY,
 	_prefixSpeechCommand: Optional[SpeechCommand] = None,
@@ -1483,7 +1519,6 @@ def getTextInfoSpeech(  # noqa: C901
 		speakTextInfoState = SpeakTextInfoState(info.obj)
 	else:
 		speakTextInfoState = None
-	autoLanguageSwitching = config.conf["speech"]["autoLanguageSwitching"]
 	extraDetail = unit in (textInfos.UNIT_CHARACTER, textInfos.UNIT_WORD)
 	if not formatConfig:
 		formatConfig = config.conf["documentFormatting"]
@@ -1495,7 +1530,7 @@ def getTextInfoSpeech(  # noqa: C901
 	)
 	# For performance reasons, when navigating by paragraph or table cell, spelling errors will not be announced.
 	if unit in (textInfos.UNIT_PARAGRAPH, textInfos.UNIT_CELL) and reason == OutputReason.CARET:
-		formatConfig["reportSpellingErrors"] = False
+		formatConfig["reportSpellingErrors2"] = 0
 
 	# Fetch the last controlFieldStack, or make a blank one
 	controlFieldStackCache = speakTextInfoState.controlFieldStackCache if speakTextInfoState else []
@@ -1647,14 +1682,16 @@ def getTextInfoSpeech(  # noqa: C901
 	if fieldSequence:
 		speechSequence.extend(fieldSequence)
 	language = None
-	if autoLanguageSwitching:
+	if languageHandling.shouldMakeLangChangeCommand():
 		language = newFormatField.get("language")
 		speechSequence.append(LangChangeCommand(language))
 		lastLanguage = language
 	isWordOrCharUnit = unit in (textInfos.UNIT_CHARACTER, textInfos.UNIT_WORD)
 	firstText = ""
 	if len(textWithFields) > 0:
-		firstText = textWithFields[0].strip() if not textWithFields[0].isspace() else textWithFields[0]
+		firstField = textWithFields[0]
+		if isinstance(firstField, str):
+			firstText = firstField.strip() if not firstField.isspace() else firstField
 	if onlyInitialFields or (
 		isWordOrCharUnit
 		and (len(firstText) == 1 or len(unicodeNormalize(firstText)) == 1)
@@ -1762,21 +1799,21 @@ def getTextInfoSpeech(  # noqa: C901
 				)
 				if fieldSequence:
 					inTextChunk = False
-				if autoLanguageSwitching:
+				if languageHandling.shouldMakeLangChangeCommand():
 					newLanguage = command.field.get("language")
 					if lastLanguage != newLanguage:
 						# The language has changed, so this starts a new text chunk.
 						inTextChunk = False
 			if not inTextChunk:
 				if fieldSequence:
-					if autoLanguageSwitching and lastLanguage is not None:
+					if languageHandling.shouldMakeLangChangeCommand() and lastLanguage is not None:
 						# Fields must be spoken in the default language.
 						relativeSpeechSequence.append(LangChangeCommand(None))
 						lastLanguage = None
 					relativeSpeechSequence.extend(fieldSequence)
 				if command.command == "controlStart" and command.field.get("role") == controlTypes.Role.MATH:
 					_extendSpeechSequence_addMathForTextInfo(relativeSpeechSequence, info, command.field)
-				if autoLanguageSwitching and newLanguage != lastLanguage:
+				if languageHandling.shouldMakeLangChangeCommand() and newLanguage != lastLanguage:
 					relativeSpeechSequence.append(LangChangeCommand(newLanguage))
 					lastLanguage = newLanguage
 	if (
@@ -1791,7 +1828,7 @@ def getTextInfoSpeech(  # noqa: C901
 		and allIndentation != speakTextInfoState.indentationCache
 	):
 		indentationSpeech = getIndentationSpeech(allIndentation, formatConfig)
-		if autoLanguageSwitching and speechSequence[-1].lang is not None:
+		if languageHandling.shouldMakeLangChangeCommand() and speechSequence[-1].lang is not None:
 			# Indentation must be spoken in the default language,
 			# but the initial format field specified a different language.
 			# Insert the indentation before the LangChangeCommand.
@@ -1813,7 +1850,7 @@ def getTextInfoSpeech(  # noqa: C901
 		shouldConsiderTextInfoBlank = False
 
 	# Finally get speech text for any fields left in new controlFieldStack that are common with the old controlFieldStack (for closing), if extra detail is not requested
-	if autoLanguageSwitching and lastLanguage is not None:
+	if languageHandling.shouldMakeLangChangeCommand() and lastLanguage is not None:
 		speechSequence.append(
 			LangChangeCommand(None),
 		)
@@ -1870,7 +1907,7 @@ def _getTextInfoSpeech_considerSpelling(
 	speechSequence: SpeechSequence,
 	language: str,
 ) -> Generator[SpeechSequence, None, None]:
-	if onlyInitialFields or any(isinstance(x, str) for x in speechSequence):
+	if onlyInitialFields or speechSequence:
 		yield speechSequence
 	if not onlyInitialFields:
 		spellingSequence = list(
@@ -2620,6 +2657,19 @@ def getFormatFieldSpeech(  # noqa: C901
 			# Translators: Speaks the heading level (example output: heading level 2).
 			text = _("heading level %d") % headingLevel
 			textList.append(text)
+	collapsed = attrs.get("collapsed")
+	oldCollapsed = attrsCache.get("collapsed") if attrsCache is not None else None
+	# collapsed state should be spoken when beginning to speak lines or paragraphs
+	# Ensuring a similar experience to if  it was a state on  a controlField
+	if collapsed and (
+		initialFormat
+		and (
+			reason in [OutputReason.FOCUS, OutputReason.QUICKNAV]
+			or unit in (textInfos.UNIT_LINE, textInfos.UNIT_PARAGRAPH)
+		)
+		or collapsed != oldCollapsed
+	):
+		textList.append(State.COLLAPSED.displayString)
 	if formatConfig["reportStyle"]:
 		style = attrs.get("style")
 		oldStyle = attrsCache.get("style") if attrsCache is not None else None
@@ -2957,20 +3007,21 @@ def getFormatFieldSpeech(  # noqa: C901
 				# Translators: Reported when text no longer contains a bookmark
 				text = _("out of bookmark")
 				textList.append(text)
-	if formatConfig["reportSpellingErrors"]:
+	if formatConfig["reportSpellingErrors2"]:
 		invalidSpelling = attrs.get("invalid-spelling")
 		oldInvalidSpelling = attrsCache.get("invalid-spelling") if attrsCache is not None else None
 		if (invalidSpelling or oldInvalidSpelling is not None) and invalidSpelling != oldInvalidSpelling:
+			texts = []
 			if invalidSpelling:
-				# Translators: Reported when text contains a spelling error.
-				text = _("spelling error")
+				if formatConfig["reportSpellingErrors2"] & ReportSpellingErrors.SOUND.value:
+					texts.append(WaveFileCommand(r"waves\textError.wav"))
+				if formatConfig["reportSpellingErrors2"] & ReportSpellingErrors.SPEECH.value:
+					# Translators: Reported when text contains a spelling error.
+					texts.append(_("spelling error"))
 			elif extraDetail:
 				# Translators: Reported when moving out of text containing a spelling error.
-				text = _("out of spelling error")
-			else:
-				text = ""
-			if text:
-				textList.append(text)
+				texts.append(_("out of spelling error"))
+			textList.extend(texts)
 		invalidGrammar = attrs.get("invalid-grammar")
 		oldInvalidGrammar = attrsCache.get("invalid-grammar") if attrsCache is not None else None
 		if (invalidGrammar or oldInvalidGrammar is not None) and invalidGrammar != oldInvalidGrammar:

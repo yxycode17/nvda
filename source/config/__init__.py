@@ -1,5 +1,5 @@
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2006-2024 NV Access Limited, Aleksey Sadovoy, Peter Vágner, Rui Batista, Zahari Yurukov,
+# Copyright (C) 2006-2025 NV Access Limited, Aleksey Sadovoy, Peter Vágner, Rui Batista, Zahari Yurukov,
 # Joseph Lee, Babbage B.V., Łukasz Golonka, Julien Cochuyt, Cyrille Bougot
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
@@ -13,8 +13,6 @@ For the latter two actions, one can perform actions prior to and/or after they t
 from enum import Enum
 import globalVars
 import winreg
-import ctypes
-import ctypes.wintypes
 import os
 import sys
 import errno
@@ -27,6 +25,7 @@ from configobj.validate import Validator
 from logHandler import log
 import logging
 from logging import DEBUG
+import winBindings.shell32
 from shlobj import FolderId, SHGetKnownFolderPath
 import baseObject
 import easeOfAccess
@@ -36,11 +35,11 @@ import extensionPoints
 from . import profileUpgrader
 from . import aggregatedSection
 from .configSpec import confspec
-from .configFlags import OutputMode
 from .featureFlag import (
 	_transformSpec_AddFeatureFlagDefault,
 	_validateConfig_featureFlag,
 )
+from .registry import RegistryKey as _RegistryKey
 from typing import (
 	Any,
 	Dict,
@@ -49,7 +48,6 @@ from typing import (
 	Set,
 	Tuple,
 )
-from addonAPIVersion import BACK_COMPAT_TO
 import NVDAState
 from NVDAState import WritePaths
 
@@ -79,12 +77,15 @@ post_configReset = extensionPoints.Action()
 
 def __getattr__(attrName: str) -> Any:
 	"""Module level `__getattr__` used to preserve backward compatibility."""
+	if attrName == "RegistryKey" and NVDAState._allowDeprecatedAPI():
+		log.warning("Importing RegistryKey from here is deprecated, use config.registry.RegistryKey instead.")
+		return _RegistryKey
 	if attrName == "NVDA_REGKEY" and NVDAState._allowDeprecatedAPI():
 		log.warning("NVDA_REGKEY is deprecated, use RegistryKey.NVDA instead.")
-		return RegistryKey.NVDA.value
+		return _RegistryKey.NVDA.value
 	if attrName == "RUN_REGKEY" and NVDAState._allowDeprecatedAPI():
 		log.warning("RUN_REGKEY is deprecated, use RegistryKey.RUN instead.")
-		return RegistryKey.RUN.value
+		return _RegistryKey.RUN.value
 	if attrName == "addConfigDirsToPythonPackagePath" and NVDAState._allowDeprecatedAPI():
 		log.warning(
 			"addConfigDirsToPythonPackagePath is deprecated, "
@@ -100,7 +101,7 @@ def __getattr__(attrName: str) -> Any:
 			"Instead use RegistryKey.CONFIG_IN_LOCAL_APPDATA_SUBKEY. ",
 			stack_info=True,
 		)
-		return RegistryKey.CONFIG_IN_LOCAL_APPDATA_SUBKEY.value
+		return _RegistryKey.CONFIG_IN_LOCAL_APPDATA_SUBKEY.value
 	raise AttributeError(f"module {repr(__name__)} has no attribute {repr(attrName)}")
 
 
@@ -121,45 +122,22 @@ def saveOnExit():
 			pass
 
 
-class RegistryKey(str, Enum):
-	INSTALLED_COPY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NVDA"
-	RUN = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-	NVDA = r"SOFTWARE\NVDA"
-	r"""
-	The name of the registry key stored under HKEY_LOCAL_MACHINE where system wide NVDA settings are stored.
-	Note that NVDA is a 32-bit application, so on X64 systems,
-	this will evaluate to `r"SOFTWARE\WOW6432Node\nvda"`
-	"""
-	CONFIG_IN_LOCAL_APPDATA_SUBKEY = "configInLocalAppData"
-	"""
-	#6864: The name of the subkey stored under RegistryKey.NVDA where the value is stored
-	which will make an installed NVDA load the user configuration either from the local or from
-	the roaming application data profile.
-	The registry value is unset by default.
-	When setting it manually, a DWORD value is preferred.
-	A value of 0 will evaluate to loading the configuration from the roaming application data (default).
-	A value of 1 means loading the configuration from the local application data folder.
-	"""
-	FORCE_SECURE_MODE_SUBKEY = "forceSecureMode"
-	SERVICE_DEBUG_SUBKEY = "serviceDebug"
-
-
 def isInstalledCopy() -> bool:
 	"""Checks to see if this running copy of NVDA is installed on the system"""
 	try:
 		k = winreg.OpenKey(
 			winreg.HKEY_LOCAL_MACHINE,
-			RegistryKey.INSTALLED_COPY.value,
+			_RegistryKey.INSTALLED_COPY.value,
 		)
 	except FileNotFoundError:
 		log.debug(
-			f"Unable to find isInstalledCopy registry key {RegistryKey.INSTALLED_COPY}"
+			f"Unable to find isInstalledCopy registry key {_RegistryKey.INSTALLED_COPY}"
 			"- this is not an installed copy.",
 		)
 		return False
 	except WindowsError:
 		log.error(
-			f"Unable to open isInstalledCopy registry key {RegistryKey.INSTALLED_COPY}",
+			f"Unable to open isInstalledCopy registry key {_RegistryKey.INSTALLED_COPY}",
 			exc_info=True,
 		)
 		return False
@@ -168,7 +146,7 @@ def isInstalledCopy() -> bool:
 		instDir = winreg.QueryValueEx(k, "UninstallDirectory")[0]
 	except FileNotFoundError:
 		log.debug(
-			f"Unable to find UninstallDirectory value for {RegistryKey.INSTALLED_COPY}"
+			f"Unable to find UninstallDirectory value for {_RegistryKey.INSTALLED_COPY}"
 			"- this may not be an installed copy.",
 		)
 		return False
@@ -190,7 +168,7 @@ def isInstalledCopy() -> bool:
 
 def getInstalledUserConfigPath() -> Optional[str]:
 	try:
-		winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RegistryKey.NVDA.value)
+		winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _RegistryKey.NVDA.value)
 	except FileNotFoundError:
 		log.debug("Could not find nvda registry key, NVDA is not currently installed")
 		return None
@@ -291,59 +269,9 @@ def getStartAfterLogon() -> bool:
 	"""Not to be confused with getStartOnLogonScreen.
 
 	Checks if NVDA is set to start after a logon.
-	Checks related easeOfAccess current user registry keys on Windows 8 or newer.
-	Then, checks the registry run key to see if NVDA
-	has been registered to start after logon on Windows 7
-	or by earlier NVDA versions.
+	Checks related easeOfAccess current user registry keys.
 	"""
-	if easeOfAccess.willAutoStart(easeOfAccess.AutoStartContext.AFTER_LOGON):
-		return True
-	try:
-		k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RegistryKey.RUN.value)
-	except FileNotFoundError:
-		log.debugWarning(
-			f"Unable to find run registry key {RegistryKey.RUN}",
-			exc_info=True,
-		)
-		return False
-	except WindowsError:
-		log.error(
-			f"Unable to open run registry key {RegistryKey.RUN}",
-			exc_info=True,
-		)
-		return False
-
-	try:
-		val = winreg.QueryValueEx(k, "nvda")[0]
-	except FileNotFoundError:
-		log.debug("NVDA is not set to start after logon")
-		return False
-	except WindowsError:
-		log.error("Failed to query NVDA key to set start after logon", exc_info=True)
-		return False
-
-	try:
-		startAfterLogonPath = os.stat(val)
-	except WindowsError:
-		log.error(
-			"Failed to access the start after logon directory.",
-			exc_info=True,
-		)
-		return False
-
-	try:
-		currentSourcePath = os.stat(sys.argv[0])
-	except FileNotFoundError:
-		log.debug("Failed to access the current running NVDA directory.")
-		return False
-	except WindowsError:
-		log.error(
-			"Failed to access the current running NVDA directory.",
-			exc_info=True,
-		)
-		return False
-
-	return currentSourcePath == startAfterLogonPath
+	return easeOfAccess.willAutoStart(easeOfAccess.AutoStartContext.AFTER_LOGON)
 
 
 def setStartAfterLogon(enable: bool) -> None:
@@ -351,33 +279,10 @@ def setStartAfterLogon(enable: bool) -> None:
 
 	Toggle if NVDA automatically starts after a logon.
 	Sets easeOfAccess related registry keys.
-
-	When toggling off, always delete the registry run key
-	in case it was set by an earlier version of NVDA.
 	"""
 	if getStartAfterLogon() == enable:
 		return
 	easeOfAccess.setAutoStart(easeOfAccess.AutoStartContext.AFTER_LOGON, enable)
-	if enable:
-		return
-	# We're disabling, so ensure the run key is cleared,
-	# as it might have been set by an old version.
-	k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RegistryKey.RUN.value, 0, winreg.KEY_WRITE)
-	try:
-		winreg.QueryValue(k, "nvda")
-	except FileNotFoundError:
-		log.debug(
-			"The run registry key is not set for setStartAfterLogon."
-			"This is expected since ease of access is used",
-		)
-		return
-	try:
-		winreg.DeleteValue(k, "nvda")
-	except WindowsError:
-		log.error(
-			"Couldn't unset registry key for nvda to start after logon.",
-			exc_info=True,
-		)
 
 
 SLAVE_FILENAME = os.path.join(globalVars.appDir, "nvda_slave.exe")
@@ -389,27 +294,8 @@ def getStartOnLogonScreen() -> bool:
 	Checks if NVDA is set to start on the logon screen.
 
 	Checks related easeOfAccess local machine registry keys.
-	Then, checks a NVDA registry key to see if NVDA
-	has been registered to start on logon by earlier NVDA versions.
 	"""
-	if easeOfAccess.willAutoStart(easeOfAccess.AutoStartContext.ON_LOGON_SCREEN):
-		return True
-	try:
-		k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RegistryKey.NVDA.value)
-	except FileNotFoundError:
-		log.debugWarning(f"Could not find NVDA reg key {RegistryKey.NVDA}", exc_info=True)
-	except WindowsError:
-		log.error(f"Failed to open NVDA reg key {RegistryKey.NVDA}", exc_info=True)
-	else:
-		try:
-			return bool(winreg.QueryValueEx(k, "startOnLogonScreen")[0])
-		except FileNotFoundError:
-			log.debug(f"Could not find startOnLogonScreen value for {RegistryKey.NVDA} - likely unset.")
-			return False
-		except WindowsError:
-			log.error(f"Failed to query startOnLogonScreen value for {RegistryKey.NVDA}", exc_info=True)
-			return False
-	return False
+	return easeOfAccess.willAutoStart(easeOfAccess.AutoStartContext.ON_LOGON_SCREEN)
 
 
 def _setStartOnLogonScreen(enable: bool) -> None:
@@ -418,7 +304,7 @@ def _setStartOnLogonScreen(enable: bool) -> None:
 
 def setSystemConfigToCurrentConfig():
 	fromPath = WritePaths.configDir
-	if ctypes.windll.shell32.IsUserAnAdmin():
+	if winBindings.shell32.IsUserAnAdmin():
 		_setSystemConfig(fromPath)
 	else:
 		import systemUtils
@@ -480,7 +366,10 @@ def setStartOnLogonScreen(enable: bool) -> None:
 		# Try setting it directly.
 		_setStartOnLogonScreen(enable)
 	except WindowsError:
-		log.debugWarning("Failed to set start on logon screen's config.")
+		log.debugWarning(
+			"Failed to set start on logon screen's config, retrying elevated.",
+			exc_info=True,
+		)
 		# We probably don't have admin privs, so we need to elevate to do this using the slave.
 		import systemUtils
 
@@ -526,6 +415,7 @@ class ConfigManager(object):
 		"update",
 		"development",
 		"addonStore",
+		"remote",
 	}
 	"""
 	Sections that only apply to the base configuration;
@@ -749,6 +639,9 @@ class ConfigManager(object):
 			self._dirtyProfiles.clear()
 		except PermissionError as e:
 			log.warning("Error saving configuration; probably read only file system", exc_info=True)
+			raise e
+		except Exception as e:
+			log.warning("Error saving configuration", exc_info=True)
 			raise e
 		post_configSave.notify()
 
@@ -1067,18 +960,17 @@ class ConfigManager(object):
 
 
 class ConfigValidationData(object):
-	validationFuncName = None  # type: str
+	validationFuncName: str | None = None
 
 	def __init__(self, validationFuncName):
 		self.validationFuncName = validationFuncName
 		super(ConfigValidationData, self).__init__()
 
 	# args passed to the convert function
-	args = []  # type: List[Any]
+	args: list[Any] = []
 
 	# kwargs passed to the convert function.
-	kwargs = {}  # type: Dict[str, Any]
-
+	kwargs: dict[str, Any] = {}
 	# the default value, used when config is missing.
 	default = None  # converted to the appropriate type
 
@@ -1303,74 +1195,37 @@ class AggregatedSection:
 		self.manager._markWriteProfileDirty()
 		self._cache[key] = val
 
-		# Alias ["documentFormatting"]["reportFontAttributes"] and ["speech"]["includeCLDR"]
-		# for backwards compatibility.
-		# TODO: Comment out in 2025.1.
-		if BACK_COMPAT_TO < (2025, 1, 0) and NVDAState._allowDeprecatedAPI():
-			self._linkDeprecatedValues(key, val)
+		# Alias old config items to their new counterparts for backwards compatibility.
+		# Uncomment when there are new links that need to be made.
+		# if BACK_COMPAT_TO < (2027, 1, 0) and NVDAState._allowDeprecatedAPI():
+		# self._linkDeprecatedValues(key, val)
 
 	def _linkDeprecatedValues(self, key: aggregatedSection._cacheKeyT, val: aggregatedSection._cacheValueT):
 		"""Link deprecated config keys and values to their replacements.
 
-		Args:
-			key: The configuration key to link to its new or old counterpart.
-			val: The value associated with the configuration key.
+		:arg key: The configuration key to link to its new or old counterpart.
+		:arg val: The value associated with the configuration key.
 
-		postconditions:
-			- If self.path is "documentFormatting":
-				- If key is "reportFontAttributes":
-					- If val is True, "documentFormatting.fontAttributeReporting" is set to OutputMode.SPEECH_AND_BRAILLE, otherwise, it is set to OutputMode.OFF.
-				- If key is "fontAttributeReporting":
-					- if val is OutputMode.OFF, "documentFormatting.reportFontAttributes" is set to False, otherwise, it is set to True.
+		Example of how to link values:
+
+		>>> match self.path:
+		>>> 	...
+		>>> 	case ("path", "segments"):
+		>>> 		...
+		>>> 		match key:
+		>>> 			case "newKey":
+		>>> 				# Do something to alias the new path/key to the old path/key for backwards compatibility.
+		>>> 			case "oldKey":
+		>>> 				# Do something to alias the old path/key to the new path/key for forwards compatibility.
+		>>> 			case _:
+		>>> 				# We don't care about other keys in this section.
+		>>> 				return
+		>>> 	case _:
+		>>> 		# We don't care about other sections.
+		>>> 		return
+		>>> ...
 		"""
 		match self.path:
-			case ("documentFormatting",):
-				match key:
-					case "fontAttributeReporting":
-						# Alias documentFormatting.fontAttributeReporting to documentFormatting.reportFontAttributes for backwards compatibility.
-						key = "reportFontAttributes"
-						val = bool(val)
-
-					case "reportFontAttributes":
-						# Alias documentFormatting.reportFontAttributes to documentFormatting.fontAttributeReporting for forwards compatibility.
-						log.warning(
-							"documentFormatting.reportFontAttributes is deprecated. Use documentFormatting.fontAttributeReporting instead.",
-							# Include stack info so testers can report warning to add-on author.
-							stack_info=True,
-						)
-						key = "fontAttributeReporting"
-						val = OutputMode.SPEECH_AND_BRAILLE if val else OutputMode.OFF
-
-					case _:
-						# We don't care about other keys in this section.
-						return
-
-			case ("speech",):
-				match key:
-					case "symbolDictionaries":
-						# Alias speech.symbolDictionaries to speech.includeCLDR for backwards compatibility.
-						key = "includeCLDR"
-						val = "cldr" in val
-
-					case "includeCLDR":
-						# Alias speech.includeCLDR to speech.symbolDictionaries for forwards compatibility.
-						log.warning(
-							"speech.includeCLDR is deprecated. Use speech.symbolDictionaries instead.",
-							# Include stack info so testers can report warning to add-on author.
-							stack_info=True,
-						)
-						key = "symbolDictionaries"
-						curVal = self.get(key, []).copy()
-						if val and "cldr" not in curVal:
-							curVal.append("cldr")
-						elif not val and "cldr" in curVal:
-							curVal.remove("cldr")
-						val = curVal
-
-					case _:
-						# We don't care about other keys in this section.
-						return
-
 			case _:
 				# We don't care about other sections.
 				return

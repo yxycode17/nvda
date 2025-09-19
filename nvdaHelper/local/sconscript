@@ -97,6 +97,9 @@ localLib = env.SharedLibrary(
 		"mixer.cpp",
 		"oleUtils.cpp",
 		"wasapi.cpp",
+		"screenCurtain.cpp",
+		"remoteAccess.cpp",
+		"crashDump.cpp",
 	],
 	LIBS=[
 		"advapi32.lib",
@@ -107,6 +110,12 @@ localLib = env.SharedLibrary(
 		"rpcrt4",
 		"shlwapi",
 		detoursLib,
+		"Gdi32",
+		"Gdiplus",
+		"Iphlpapi",
+		"Ws2_32",
+		"runtimeobject",
+		"dbghelp",
 	],
 )
 

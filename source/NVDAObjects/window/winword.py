@@ -1,5 +1,6 @@
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2006-2024 NV Access Limited, Manish Agrawal, Derek Riemer, Babbage B.V., Cyrille Bougot
+# Copyright (C) 2006-2025 NV Access Limited, Manish Agrawal, Derek Riemer, Babbage B.V., Cyrille Bougot,
+# Leonard de Ruijter
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
 
@@ -27,6 +28,7 @@ import ui
 import NVDAHelper
 import XMLFormatting
 from logHandler import log
+from winBindings import user32
 import winUser
 import oleacc
 import speech
@@ -40,7 +42,7 @@ from controlTypes.formatFields import TextAlign
 import treeInterceptorHandler
 import browseMode
 from . import Window
-from ..behaviors import EditableTextWithoutAutoSelectDetection
+from ..behaviors import EditableTextBase, EditableTextWithoutAutoSelectDetection
 from . import _msOfficeChart
 from ._msOffice import MsoHyperlink
 import locationHelper
@@ -151,6 +153,17 @@ wdAlignParagraphLeft = 0
 wdAlignParagraphCenter = 1
 wdAlignParagraphRight = 2
 wdAlignParagraphJustify = 3
+
+
+class WdOutlineLevel(IntEnum):
+	"""Outline level of a paragraph.
+
+	.. seealso:: ```WdOutlineLevel`` enumeration <https://learn.microsoft.com/en-us/office/vba/api/word.wdoutlinelevel>`_
+	"""
+
+	BODY_TEXT = 10
+
+
 # Units
 wdCharacter = 1
 wdWord = 2
@@ -459,7 +472,7 @@ wdContentControlTypesToNVDARoles = {
 
 winwordWindowIid = GUID("{00020962-0000-0000-C000-000000000046}")
 
-wm_winword_expandToLine = ctypes.windll.user32.RegisterWindowMessageW("wm_winword_expandToLine")
+wm_winword_expandToLine = user32.RegisterWindowMessage("wm_winword_expandToLine")
 
 NVDAUnitsToWordUnits = {
 	textInfos.UNIT_CHARACTER: wdCharacter,
@@ -1113,6 +1126,10 @@ class WordDocumentTextInfo(textInfos.TextInfo):
 				field["name"] = name
 				field["alwaysReportName"] = True
 				field["role"] = controlTypes.Role.FRAME
+		if field.pop("collapsedState", None) == "true":
+			if "states" not in field:
+				field["states"] = set()
+			field["states"].add(controlTypes.State.COLLAPSED)
 		newField = LazyControlField_RowAndColumnHeaderText(self)
 		newField.update(field)
 		return newField
@@ -1437,7 +1454,11 @@ class WordDocumentTreeInterceptor(browseMode.BrowseModeDocumentTreeInterceptor):
 		while True:
 			if not isFirst or includeCurrent:
 				level = rangeObj.paragraphs[1].outlineLevel
-				if level and 0 < level < 10 and (not neededLevel or neededLevel == level):
+				if (
+					level
+					and 0 < level < WdOutlineLevel.BODY_TEXT
+					and (not neededLevel or neededLevel == level)
+				):
 					rangeObj.expand(wdParagraph)
 					yield WordDocumentHeadingQuickNavItem(
 						nodeType,
@@ -1569,7 +1590,9 @@ class WordDocumentTreeInterceptor(browseMode.BrowseModeDocumentTreeInterceptor):
 	}
 
 
-class WordDocument(Window):
+class WordDocument(Window, EditableTextBase):
+	_supportsSentenceNavigation = True
+
 	def winwordColorToNVDAColor(self, val):
 		if val >= 0:
 			# normal RGB value
@@ -2046,6 +2069,45 @@ class WordDocument(Window):
 		)
 		# Translators: a message when toggling paragraph spacing in Microsoft word
 		ui.message(_("{val:g} pt space before paragraph").format(val=val))
+
+	@script(
+		gestures=(
+			"kb:alt+home",
+			"kb:alt+end",
+			"kb:alt+pageUp",
+			"kb:alt+pageDown",
+		),
+	)
+	def script_caret_moveByCell(self, gesture: "inputCore.InputGesture") -> None:
+		info = self.makeTextInfo(textInfos.POSITION_SELECTION)
+		inTable = self._inTable(info)
+		if not inTable:
+			gesture.send()
+			return
+		oldSelection = info.start, info.end
+		gesture.send()
+		start = time.time()
+		retryInterval = 0.01
+		maxTimeout = 0.15
+		elapsed = 0
+		while True:
+			if scriptHandler.isScriptWaiting():
+				# Prevent lag if keys are pressed rapidly
+				return
+			info = self.makeTextInfo(textInfos.POSITION_SELECTION)
+			newSelection = info.start, info.end
+			if newSelection != oldSelection:
+				elapsed = time.time() - start
+				log.debug(f"Detected new selection after {elapsed} sec")
+				break
+			elapsed = time.time() - start
+			if elapsed >= maxTimeout:
+				log.debug(f"Canceled detecting new selection after {elapsed} sec")
+				break
+			time.sleep(retryInterval)
+		info.expand(textInfos.UNIT_CELL)
+		speech.speakTextInfo(info, reason=controlTypes.OutputReason.FOCUS)
+		braille.handler.handleCaretMove(self)
 
 	def initOverlayClass(self):
 		if isinstance(self, EditableTextWithoutAutoSelectDetection):

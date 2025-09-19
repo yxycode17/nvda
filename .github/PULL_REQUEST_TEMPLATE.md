@@ -8,12 +8,15 @@ See https://github.com/nvaccess/nvda/blob/master/.github/CONTRIBUTING.md.
 -->
 
 ### Link to issue number:
+<!-- Use Closes/Fixes/Resolves #xxx to link this PR to the issue it is responding to. -->
 
 ### Summary of the issue:
 
-### Description of user facing changes
+### Description of user facing changes:
 
-### Description of development approach
+### Description of developer facing changes:
+
+### Description of development approach:
 
 ### Testing strategy:
 
@@ -49,6 +52,3 @@ https://github.com/nvaccess/nvda/blob/master/projectDocs/dev/githubPullRequestTe
   - Localization in other languages / culture than English
 - [ ] API is compatible with existing add-ons.
 - [ ] Security precautions taken.
-
-<!-- Please keep the following -->
-@coderabbitai summary

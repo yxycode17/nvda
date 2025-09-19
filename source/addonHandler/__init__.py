@@ -1,6 +1,6 @@
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2012-2024 Rui Batista, NV Access Limited, Noelia Ruiz Martínez,
-# Joseph Lee, Babbage B.V., Arnold Loubriat, Łukasz Golonka, Leonard de Ruijter, Julien Cochuyt
+# Copyright (C) 2012-2025 Rui Batista, NV Access Limited, Noelia Ruiz Martínez, Joseph Lee, Babbage B.V.,
+# Arnold Loubriat, Łukasz Golonka, Leonard de Ruijter, Julien Cochuyt, Cyrille Bougot
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
 
@@ -20,6 +20,7 @@ from six import string_types
 from typing import (
 	Callable,
 	Dict,
+	IO,
 	Literal,
 	Optional,
 	Set,
@@ -31,9 +32,10 @@ import zipfile
 from configobj import ConfigObj
 from configobj.validate import Validator
 import config
+from config.registry import ADDON_BUNDLE_EXTENSION
 import languageHandler
 from logHandler import log
-import winKernel
+import winBindings.kernel32
 import addonAPIVersion
 import importlib
 import NVDAState
@@ -43,6 +45,7 @@ from types import ModuleType
 from addonStore.models.status import AddonStateCategory, SupportsAddonState
 from addonStore.models.version import MajorMinorPatch, SupportsVersionCheck
 import extensionPoints
+from utils._deprecate import handleDeprecations, MovedSymbol
 from utils.caseInsensitiveCollections import CaseInsensitiveSet
 from utils.tempFile import _createEmptyTempFileForDeletingFile
 
@@ -61,11 +64,22 @@ if TYPE_CHECKING:
 		InstalledAddonStoreModel,
 	)
 
+__getattr__ = handleDeprecations(
+	MovedSymbol(
+		"BUNDLE_EXTENSION",
+		"config",
+		"registry",
+		"ADDON_BUNDLE_EXTENSION",
+	),
+	MovedSymbol(
+		"NVDA_ADDON_PROG_ID",
+		"config.registry",
+	),
+)
+
 MANIFEST_FILENAME = "manifest.ini"
 stateFilename = "addonsState.pickle"
-BUNDLE_EXTENSION = "nvda-addon"
 BUNDLE_MIMETYPE = "application/x-nvda-addon"
-NVDA_ADDON_PROG_ID = "NVDA.Addon.1"
 ADDON_PENDINGINSTALL_SUFFIX = ".pendingInstall"
 DELETEDIR_SUFFIX = ".delete"
 
@@ -262,6 +276,11 @@ def getIncompatibleAddons(
 
 def removeFailedDeletion(path: os.PathLike):
 	shutil.rmtree(path, ignore_errors=True)
+	if os.path.exists(path):
+		try:
+			os.remove(path)
+		except Exception:
+			pass
 	if os.path.exists(path):
 		log.error(f"Failed to delete path {path}, try removing manually")
 
@@ -944,7 +963,8 @@ class AddonBundle(AddonBase):
 					# #2505: Handle non-Unicode file names.
 					# Most archivers seem to use the local OEM code page, even though the spec says only cp437.
 					# HACK: Overriding info.filename is a bit ugly, but it avoids a lot of code duplication.
-					info.filename = info.filename.decode("cp%d" % winKernel.kernel32.GetOEMCP())
+					oemcp = winBindings.kernel32.GetOEMCP()
+					info.filename = info.filename.decode(f"cp{oemcp}")
 				z.extract(info, addonPath)
 
 	@property
@@ -972,7 +992,7 @@ def createAddonBundleFromPath(path, destDir=None):
 	if manifest.errors is not None:
 		_report_manifest_errors(manifest)
 		raise AddonError("Manifest file has errors.")
-	bundleFilename = "%s-%s.%s" % (manifest["name"], manifest["version"], BUNDLE_EXTENSION)
+	bundleFilename = f"{manifest['name']}-{manifest['version']}.{ADDON_BUNDLE_EXTENSION}"
 	bundleDestination = os.path.join(destDir, bundleFilename)
 	with zipfile.ZipFile(bundleDestination, "w") as z:
 		# FIXME: the include/exclude feature may or may not be useful. Also python files can be pre-compiled.
@@ -1012,6 +1032,10 @@ author = string()
 # Version of the add-on.
 # Suggested convention is <major>.<minor>.<patch> format.
 version = string()
+
+# Changelog for the add-on version.
+# Document changes between the previous and the current versions.
+changelog = string(default=None)
 
 # The minimum required NVDA version for this add-on to work correctly.
 # Should be less than or equal to lastTestedNVDAVersion
@@ -1054,12 +1078,11 @@ docFileName = string(default=None)
 		),
 	)
 
-	def __init__(self, input, translatedInput=None):
-		"""Constructs an L{AddonManifest} instance from manifest string data
-		@param input: data to read the manifest information
-		@type input: a fie-like object.
-		@param translatedInput: translated manifest input
-		@type translatedInput: file-like object
+	def __init__(self, input: IO[bytes], translatedInput: IO[bytes] | None = None):
+		"""Constructs an :class:`AddonManifest` instance from manifest string data
+
+		:param input: data to read the manifest information
+		:param translatedInput: Optional translated manifest input, defaults to ``None``
 		"""
 		super().__init__(input, configspec=self.configspec, encoding="utf-8", default_encoding="utf-8")
 		self._errors = None
@@ -1075,7 +1098,7 @@ docFileName = string(default=None)
 		self._translatedConfig = None
 		if translatedInput is not None:
 			self._translatedConfig = ConfigObj(translatedInput, encoding="utf-8", default_encoding="utf-8")
-			for k in ("summary", "description"):
+			for k in ("summary", "description", "changelog"):
 				val = self._translatedConfig.get(k)
 				if val:
 					self[k] = val

@@ -1,17 +1,19 @@
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2006-2023 NV Access Limited, Dinesh Kaushal, Siddhartha Gupta, Accessolutions, Julien Cochuyt,
+# Copyright (C) 2006-2025 NV Access Limited, Dinesh Kaushal, Siddhartha Gupta, Accessolutions, Julien Cochuyt,
 # Cyrille Bougot, Leonard de Ruijter
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
 
+from __future__ import annotations
 import abc
 import ctypes
 import enum
-from typing import (
-	Any,
-	Dict,
-	Optional,
-)
+from winBindings import user32
+import winBindings.gdi32
+
+from typing import Any
+from collections.abc import Callable
+import warnings
 
 from comtypes import COMError, BSTR
 import comtypes.automation
@@ -43,6 +45,7 @@ import mouseHandler
 from displayModel import DisplayModelTextInfo
 import controlTypes
 from controlTypes import TextPosition, TextAlign, VerticalTextAlign
+from NVDAHelper.localLib import EXCEL_CELLINFO
 from . import Window
 from .. import NVDAObjectTextInfo
 import scriptHandler
@@ -53,6 +56,10 @@ from utils.displayString import DisplayStringIntEnum
 import NVDAState
 from globalCommands import SCRCAT_SYSTEMCARET
 from ._msOffice import MsoHyperlink
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+	from ._msOfficeChart import OfficeChart
 
 excel2010VersionMajor = 14
 
@@ -131,14 +138,22 @@ def __getattr__(attrName: str) -> Any:
 			1: "default",
 		},
 	}
-	if attrName in _deprecatedConstantsMap and NVDAState._allowDeprecatedAPI():
-		replacementSymbol = _deprecatedConstantsMap[attrName]
-		log.warning(
-			f"Importing {attrName} from here is deprecated. "
-			f"Import XlVAlign or XlHAlign enumerations instead.",
-			stack_info=True,
-		)
-		return replacementSymbol
+	if NVDAState._allowDeprecatedAPI():
+		if attrName in _deprecatedConstantsMap:
+			replacementSymbol = _deprecatedConstantsMap[attrName]
+			log.warning(
+				f"Importing {attrName} from here is deprecated. "
+				f"Import XlVAlign or XlHAlign enumerations instead.",
+				stack_info=True,
+			)
+			return replacementSymbol
+		elif attrName == "ExcelCellInfo":
+			warnings.warn(
+				"NVDAObjects.window.excel.ExcelCellInfo is deprecated. Use NVDAHelper.localLib.EXCEL_CELLINFO instead.",
+				DeprecationWarning,
+				stacklevel=2,
+			)
+			return EXCEL_CELLINFO
 	raise AttributeError(f"module {repr(__name__)} has no attribute {repr(attrName)}")
 
 
@@ -148,6 +163,16 @@ xlToRight = -4161
 xlUp = -4162
 xlCellWidthUnitToPixels = 7.5919335705812574139976275207592
 xlSheetVisible = -1
+
+
+class XlApplicationInternational(enum.IntEnum):
+	"""Specifies country/region and international settings.
+
+	.. seealso:: ```XlApplicationInternational`` enumeration (Excel) <https://learn.microsoft.com/en-us/office/vba/api/excel.xlapplicationinternational>`_
+	"""
+
+	LIST_SEPARATOR = 5
+
 
 xlA1 = 1
 xlRC = 2
@@ -795,6 +820,15 @@ class ExcelBase(Window):
 			obj.parent = selection
 		return obj
 
+	def _getActiveCell(self) -> "ExcelCell":
+		cell = self.excelWindowObject.ActiveCell
+		obj = ExcelCell(
+			windowHandle=self.windowHandle,
+			excelWindowObject=self.excelWindowObject,
+			excelCellObject=cell,
+		)
+		return obj
+
 	def _getSelection(self):
 		selection = self.excelWindowObject.Selection
 		try:
@@ -851,7 +885,7 @@ class Excel7Window(ExcelBase):
 		return self.excelWindowObjectFromWindow(self.windowHandle)
 
 	def _get_focusRedirect(self):
-		selection = self._getSelection()
+		selection = self._getActiveCell()
 		dropdown = self._getDropdown(selection=selection)
 		if dropdown:
 			return dropdown
@@ -1094,6 +1128,22 @@ class ExcelWorksheet(ExcelBase):
 			"kb:numpadEnter",
 			"kb:shift+enter",
 			"kb:shift+numpadEnter",
+		),
+		canPropagate=True,
+	)
+	def script_changeActiveCell(self, gesture: inputCore.InputGesture) -> None:
+		isChartActive = True if self.excelWindowObject.ActiveChart else False
+		if isChartActive:
+			objGetter = self._getSelection
+		else:
+			objGetter = self._getActiveCell
+		self.changeSelectionOrActiveCell(
+			gesture=gesture,
+			objGetter=objGetter,
+		)
+
+	@scriptHandler.script(
+		gestures=(
 			"kb:upArrow",
 			"kb:downArrow",
 			"kb:leftArrow",
@@ -1140,8 +1190,18 @@ class ExcelWorksheet(ExcelBase):
 		),
 		canPropagate=True,
 	)
-	def script_changeSelection(self, gesture):
-		oldSelection = self._getSelection()
+	def script_changeSelection(self, gesture: inputCore.InputGesture) -> None:
+		self.changeSelectionOrActiveCell(
+			gesture=gesture,
+			objGetter=self._getSelection,
+		)
+
+	def changeSelectionOrActiveCell(
+		self,
+		gesture: inputCore.InputGesture,
+		objGetter: Callable[[], ExcelCell | ExcelSelection | OfficeChart],
+	):
+		oldSelection = objGetter()
 		gesture.send()
 		newSelection = None
 		start = time.time()
@@ -1157,7 +1217,7 @@ class ExcelWorksheet(ExcelBase):
 			if eventHandler.isPendingEvents("gainFocus"):
 				# This object is no longer focused.
 				return
-			newSelection = self._getSelection()
+			newSelection = objGetter()
 			if newSelection and newSelection != oldSelection:
 				log.debug(f"Detected new selection after {elapsed} sec")
 				break
@@ -1395,7 +1455,7 @@ class NvCellState(enum.IntEnum):
 	UNLOCKED = (1 << 10,)
 
 
-_nvCellStatesToStates: Dict[NvCellState, controlTypes.State] = {
+_nvCellStatesToStates: dict[NvCellState, controlTypes.State] = {
 	NvCellState.EXPANDED: controlTypes.State.EXPANDED,
 	NvCellState.COLLAPSED: controlTypes.State.COLLAPSED,
 	NvCellState.LINKED: controlTypes.State.LINKED,
@@ -1407,23 +1467,6 @@ _nvCellStatesToStates: Dict[NvCellState, controlTypes.State] = {
 	NvCellState.OVERFLOWING: controlTypes.State.OVERFLOWING,
 	NvCellState.UNLOCKED: controlTypes.State.UNLOCKED,
 }
-
-
-class ExcelCellInfo(ctypes.Structure):
-	_fields_ = [
-		("text", comtypes.BSTR),
-		("address", comtypes.BSTR),
-		("inputTitle", comtypes.BSTR),
-		("inputMessage", comtypes.BSTR),
-		("nvCellStates", ctypes.c_longlong),  # bitwise OR of the NvCellState enum values.
-		("rowNumber", ctypes.c_long),
-		("rowSpan", ctypes.c_long),
-		("columnNumber", ctypes.c_long),
-		("columnSpan", ctypes.c_long),
-		("outlineLevel", ctypes.c_long),
-		("comments", comtypes.BSTR),
-		("formula", comtypes.BSTR),
-	]
 
 
 class ExcelCellInfoQuickNavItem(browseMode.QuickNavItem):
@@ -1474,6 +1517,16 @@ class CommentExcelCellInfoQuickNavItem(ExcelCellInfoQuickNavItem):
 		return "%s: %s" % (self.excelCellInfo.address.split("!")[-1], self.excelCellInfo.comments)
 
 
+def convertAddressToLocal(application: comtypes.client.lazybind.Dispatch, address: str) -> str:
+	"""Converts a range address string from invariant to local representation.
+	E.g. "'[Filename.xlsx]Sheet1'!$A$2,$A$4" becomes "'[Filename.xlsx]Sheet1'!$A$2;$A$4" on a French system.
+	"""
+
+	fileAndSheet, range = address.rsplit("!", 1)
+	sep = application.International(XlApplicationInternational.LIST_SEPARATOR)
+	return f"{fileAndSheet}!{range.replace(',', sep)}"
+
+
 class FormulaExcelCellInfoQuickNavItem(ExcelCellInfoQuickNavItem):
 	@property
 	def label(self):
@@ -1514,13 +1567,13 @@ class ExcelCellInfoQuicknavIterator(object, metaclass=abc.ABCMeta):
 		if not collectionObject:
 			return
 		count = collectionObject.count
-		cellInfos = (ExcelCellInfo * count)()
+		cellInfos = (EXCEL_CELLINFO * count)()
 		numCellsFetched = ctypes.c_long()
 		address = collectionObject.address(True, True, xlA1, True)
 		NVDAHelper.localLib.nvdaInProcUtils_excel_getCellInfos(
 			self.document.appModule.helperLocalBindingHandle,
 			self.document.windowHandle,
-			BSTR(address),
+			BSTR(convertAddressToLocal(worksheet.Application, address)),
 			self.cellInfoFlags,
 			count,
 			cellInfos,
@@ -1551,19 +1604,19 @@ class FormulaExcelCellInfoQuicknavIterator(ExcelCellInfoQuicknavIterator):
 
 
 class ExcelCell(ExcelBase):
-	excelCellInfo: Optional[ExcelCellInfo]
+	excelCellInfo: EXCEL_CELLINFO | None
 	"""Type info for auto property: _get_excelCellInfo"""
 
-	def _get_excelCellInfo(self) -> Optional[ExcelCellInfo]:
+	def _get_excelCellInfo(self) -> EXCEL_CELLINFO | None:
 		if not self.appModule.helperLocalBindingHandle:
 			return None
-		ci = ExcelCellInfo()
+		ci = EXCEL_CELLINFO()
 		numCellsFetched = ctypes.c_long()
 		address = self.excelCellObject.address(True, True, xlA1, True)
 		res = NVDAHelper.localLib.nvdaInProcUtils_excel_getCellInfos(
 			self.appModule.helperLocalBindingHandle,
 			self.windowHandle,
-			BSTR(address),
+			BSTR(convertAddressToLocal(self.excelCellObject.Application, address)),
 			NVCELLINFOFLAG_ALL,
 			1,
 			ctypes.byref(ci),
@@ -1804,7 +1857,7 @@ class ExcelCell(ExcelBase):
 			and controlTypes.State.UNLOCKED not in self.states
 			and controlTypes.State.PROTECTED in self.parent.states
 		):
-			winsound.PlaySound("Default", winsound.SND_ALIAS | winsound.SND_NOWAIT | winsound.SND_ASYNC)
+			winsound.MessageBeep()
 			return
 		super(ExcelCell, self).event_typedCharacter(ch)
 
@@ -1864,8 +1917,7 @@ class ExcelCell(ExcelBase):
 	@script(
 		description=_(
 			# Translators: the description for a script for Excel
-			"Reports the note on the current cell. "
-			"If pressed twice, presents the information in browse mode",
+			"Reports the note on the current cell. If pressed twice, presents the information in browse mode",
 		),
 		gesture="kb:NVDA+alt+c",
 		category=SCRCAT_SYSTEMCARET,
@@ -2193,12 +2245,12 @@ class ExcelFormControl(ExcelBase):
 		# bottom right cell's height in points
 		bottomRightCellHeight = bottomRightAddress.Height
 		self.excelApplicationObject = self.parent.excelWorksheetObject.Application
-		hDC = ctypes.windll.user32.GetDC(None)
+		hDC = user32.GetDC(None)
 		# pixels per inch along screen width
-		px = ctypes.windll.gdi32.GetDeviceCaps(hDC, LOGPIXELSX)
+		px = winBindings.gdi32.GetDeviceCaps(hDC, LOGPIXELSX)
 		# pixels per inch along screen height
-		py = ctypes.windll.gdi32.GetDeviceCaps(hDC, LOGPIXELSY)
-		ctypes.windll.user32.ReleaseDC(None, hDC)
+		py = winBindings.gdi32.GetDeviceCaps(hDC, LOGPIXELSY)
+		user32.ReleaseDC(None, hDC)
 		zoom = self.excelApplicationObject.ActiveWindow.Zoom
 		zoomRatio = zoom / 100
 		# Conversion from inches to Points, 1 inch=72points

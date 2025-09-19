@@ -1,5 +1,5 @@
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2022 NV Access Limited
+# Copyright (C) 2022-2025 NV Access Limited
 # This file may be used under the terms of the GNU General Public License, version 2 or later.
 # For more details see: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -164,14 +164,6 @@ def isLockScreenModeActive() -> bool:
 		# Use secure mode instead if on the secure desktop
 		return False
 
-	import winVersion
-
-	if winVersion.getWinVer() < winVersion.WIN10:
-		# On Windows 8 and Earlier, the lock screen runs on
-		# the secure desktop.
-		# Lock screen mode is not supported on these Windows versions.
-		return False
-
 	return _isWindowsLocked()
 
 
@@ -187,8 +179,7 @@ def _isWindowsLocked_checkViaSessionQuery() -> bool:
 		return False
 	if sessionQueryLockState == WTS_LockState.WTS_SESSIONSTATE_UNKNOWN:
 		log.error(
-			"Unable to determine lock state via Session Query."
-			f" Lock state value: {sessionQueryLockState!r}",
+			f"Unable to determine lock state via Session Query. Lock state value: {sessionQueryLockState!r}",
 		)
 		return False
 	return sessionQueryLockState == WTS_LockState.WTS_SESSIONSTATE_LOCK

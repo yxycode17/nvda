@@ -1,10 +1,10 @@
-# -*- coding: UTF-8 -*-
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2006-2024 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Mesar Hameed, Joseph Lee,
+# Copyright (C) 2006-2025 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Mesar Hameed, Joseph Lee,
 # Thomas Stivers, Babbage B.V., Accessolutions, Julien Cochuyt
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
 
+from dataclasses import dataclass
 import threading
 import time
 import warnings
@@ -12,12 +12,13 @@ import winsound
 from collections import deque
 from collections.abc import Callable, Collection
 from enum import Enum, IntEnum, auto
-from functools import partialmethod, singledispatchmethod
-from typing import Any, Literal, NamedTuple, Optional, Self, TypeAlias
+from functools import partialmethod, singledispatchmethod, wraps
+from typing import Any, Literal, NamedTuple, Optional, Self
 
 import core
 import extensionPoints
 import wx
+from .contextHelp import ContextHelpMixin
 from logHandler import log
 
 import gui
@@ -50,6 +51,29 @@ def isModalMessageBoxActive() -> bool:
 		return _messageBoxCounter != 0
 
 
+def _countAsMessageBox():
+	"""Wrapper to increment and decrement the message box counter around the wrapped function."""
+
+	def _wrap(func):
+		@wraps(func)
+		def funcWrapper(*args, **kwargs):
+			global _messageBoxCounter
+			with _messageBoxCounterLock:
+				_messageBoxCounter += 1
+			try:
+				return func(*args, **kwargs)
+			except Exception:
+				raise
+			finally:
+				with _messageBoxCounterLock:
+					_messageBoxCounter -= 1
+
+		return funcWrapper
+
+	return _wrap
+
+
+@_countAsMessageBox()
 def displayDialogAsModal(dialog: wx.Dialog) -> int:
 	"""Display a dialog as modal.
 	@return: Same as for wx.MessageBox.
@@ -65,10 +89,6 @@ def displayDialogAsModal(dialog: wx.Dialog) -> int:
 	Because an answer is required to continue after a modal messageBox is opened,
 	some actions such as shutting down are prevented while NVDA is in a possibly uncertain state.
 	"""
-	global _messageBoxCounter
-	with _messageBoxCounterLock:
-		_messageBoxCounter += 1
-
 	try:
 		if not dialog.GetParent():
 			gui.mainFrame.prePopup()
@@ -76,8 +96,6 @@ def displayDialogAsModal(dialog: wx.Dialog) -> int:
 	finally:
 		if not dialog.GetParent():
 			gui.mainFrame.postPopup()
-		with _messageBoxCounterLock:
-			_messageBoxCounter -= 1
 
 	return res
 
@@ -153,8 +171,12 @@ class DisplayableError(Exception):
 		)
 
 
-# TODO: Change to type statement when Python 3.12 or later is in use.
-_Callback_T: TypeAlias = Callable[[], Any]
+@dataclass(frozen=True)
+class Payload:
+	"""Payload of information to pass to message dialog callbacks."""
+
+
+type _Callback_T = Callable[[Payload], Any]
 
 
 class _Missing_Type:
@@ -198,6 +220,9 @@ class EscapeCode(IntEnum):
 	"""
 
 
+type wxArtID = int
+
+
 class DialogType(Enum):
 	"""Types of message dialogs.
 	These are used to determine the icon and sound to play when the dialog is shown.
@@ -219,7 +244,7 @@ class DialogType(Enum):
 	"""
 
 	@property
-	def _wxIconId(self) -> "wx.ArtID | None":  # type: ignore
+	def _wxIconId(self) -> wxArtID | None:
 		"""The wx icon ID to use for this dialog type.
 		This is used to determine the icon to display in the dialog.
 		This will be None when the default icon should be used.
@@ -351,7 +376,7 @@ class _Command(NamedTuple):
 	returnCode: ReturnCode
 
 
-class MessageDialog(DpiScalingHelperMixinWithoutInit, wx.Dialog, metaclass=SIPABCMeta):
+class MessageDialog(DpiScalingHelperMixinWithoutInit, ContextHelpMixin, wx.Dialog, metaclass=SIPABCMeta):
 	"""Provides a more flexible message dialog.
 
 	Creating dialogs with this class is extremely flexible. You can create a dialog, passing almost all parameters to the initialiser, and only call `Show` or `ShowModal` on the instance.
@@ -830,7 +855,7 @@ class MessageDialog(DpiScalingHelperMixinWithoutInit, wx.Dialog, metaclass=SIPAB
 				dlg.setButtonLabel(ReturnCode.CANCEL, cancelLabel)
 			return dlg.ShowModal()
 
-		return wxCallOnMain(impl)  # type: ignore
+		return wxCallOnMain(impl)
 
 	@classmethod
 	def ask(
@@ -865,7 +890,7 @@ class MessageDialog(DpiScalingHelperMixinWithoutInit, wx.Dialog, metaclass=SIPAB
 				dlg.setButtonLabel(ReturnCode.CANCEL, cancelLabel)
 			return dlg.ShowModal()
 
-		return wxCallOnMain(impl)  # type: ignore
+		return wxCallOnMain(impl)
 
 	# endregion
 
@@ -1028,7 +1053,7 @@ class MessageDialog(DpiScalingHelperMixinWithoutInit, wx.Dialog, metaclass=SIPAB
 		buttons: list[wx.Button] = []
 		for id in ids:
 			if id not in self._commands:
-				raise KeyError("No button with {id=} registered.")
+				raise KeyError(f"No button with {id=} registered.")
 			elif isinstance((button := self.FindWindow(id)), wx.Button):
 				buttons.append(button)
 			else:
@@ -1098,7 +1123,7 @@ class MessageDialog(DpiScalingHelperMixinWithoutInit, wx.Dialog, metaclass=SIPAB
 		self.Hide()
 		if self.IsModal():
 			self.EndModal(self.GetReturnCode())
-		log.debug("Queueing {self!r} for destruction")
+		log.debug(f"Queueing {self!r} for destruction")
 		self.DestroyLater()
 		log.debug(f"Removing {self!r} from instances.")
 		self._instances.remove(self)
@@ -1138,7 +1163,8 @@ class MessageDialog(DpiScalingHelperMixinWithoutInit, wx.Dialog, metaclass=SIPAB
 		if callback is not None:
 			if close:
 				self.Hide()
-			callback()
+			payload = Payload()
+			callback(payload)
 		if close:
 			self.SetReturnCode(returnCode)
 			self.Close()

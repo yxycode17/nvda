@@ -1,34 +1,33 @@
-# -*- coding: UTF-8 -*-
 # A part of NonVisual Desktop Access (NVDA)
-# Copyright (C) 2006-2024 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Mesar Hameed, Joseph Lee,
+# Copyright (C) 2006-2025 NV Access Limited, Peter Vágner, Aleksey Sadovoy, Mesar Hameed, Joseph Lee,
 # Thomas Stivers, Babbage B.V., Accessolutions, Julien Cochuyt, Cyrille Bougot, Luke Davis
 # This file is covered by the GNU General Public License.
 # See the file COPYING for more details.
 
 from collections.abc import Callable
 import os
-import ctypes
 import warnings
 import wx
 import wx.adv
+import wx.lib.agw.persist
 
+import winBindings.kernel32
 import globalVars
 import tones
 import ui
-from documentationUtils import getDocFilePath, reportNoDocumentation
+from documentationUtils import getDocFilePath, displayLicense, reportNoDocumentation
 from logHandler import log
 import config
+import buildVersion
 import versionInfo
 import speech
 import queueHandler
 import core
-from typing import (
-	Any,
-	Optional,
-	Type,
-)
+from typing import Any
 import systemUtils
 from .message import (
+	Button,
+	Payload,
 	# messageBox is accessed through `gui.messageBox` as opposed to `gui.message.messageBox` throughout NVDA,
 	# be cautious when removing
 	messageBox,
@@ -47,6 +46,8 @@ from .nvdaControls import _ContinueCancelDialog
 # Be careful when removing, and only do in a compatibility breaking release.
 from .exit import ExitDialog
 from .settingsDialogs import (
+	AddonStorePanel,
+	AdvancedPanel,
 	AudioPanel,
 	BrailleDisplaySelectionDialog,
 	BrailleSettingsPanel,
@@ -59,13 +60,15 @@ from .settingsDialogs import (
 	MultiCategorySettingsDialog,
 	NVDASettingsDialog,
 	ObjectPresentationPanel,
+	RemoteSettingsPanel,
+	ReviewCursorPanel,
 	SettingsDialog,
 	SpeechSettingsPanel,
 	SpeechSymbolsDialog,
 	SynthesizerSelectionDialog,
 	TouchInteractionPanel,
-	ReviewCursorPanel,
 	UwpOcrPanel,
+	VisionSettingsPanel,
 )
 from .startupDialogs import WelcomeDialog
 from .inputGestures import InputGesturesDialog
@@ -94,10 +97,10 @@ except RuntimeError:
 ### Constants
 NVDA_PATH = globalVars.appDir
 ICON_PATH = os.path.join(NVDA_PATH, "images", "nvda.ico")
-DONATE_URL = f"{versionInfo.url}/donate/"
+DONATE_URL = f"{buildVersion.url}/donate/"
 
 ### Globals
-mainFrame: Optional["MainFrame"] = None
+mainFrame: "MainFrame | None" = None
 """Set by initialize. Should be used as the parent for "top level" dialogs.
 """
 
@@ -124,7 +127,7 @@ def __getattr__(attrName: str) -> Any:
 		return SettingsPanel
 	if attrName == "ExecAndPump" and NVDAState._allowDeprecatedAPI():
 		log.warning(
-			"Importing ExecAndPump from here is deprecated. " "Import ExecAndPump from systemUtils instead. ",
+			"Importing ExecAndPump from here is deprecated. Import ExecAndPump from systemUtils instead. ",
 			# Include stack info so testers can report warning to add-on author.
 			stack_info=True,
 		)
@@ -139,7 +142,7 @@ class MainFrame(wx.Frame):
 
 	def __init__(self):
 		style = wx.DEFAULT_FRAME_STYLE ^ wx.MAXIMIZE_BOX ^ wx.MINIMIZE_BOX | wx.FRAME_NO_TASKBAR
-		super(MainFrame, self).__init__(None, wx.ID_ANY, versionInfo.name, size=(1, 1), style=style)
+		super().__init__(None, wx.ID_ANY, buildVersion.name, size=(1, 1), style=style)
 		self.Bind(wx.EVT_CLOSE, self.onExitCommand)
 		self.sysTrayIcon = SysTrayIcon(self)
 		#: The focus before the last popup or C{None} if unknown.
@@ -234,9 +237,17 @@ class MainFrame(wx.Frame):
 				_("Error"),
 				wx.OK | wx.ICON_ERROR,
 			)
+		except Exception:
+			messageBox(
+				# Translators: Message shown when current configuration cannot be saved, for an unknown reason.
+				_("Could not save configuration; see the log for more details."),
+				# Translators: the title of an error message dialog
+				_("Error"),
+				wx.OK | wx.ICON_ERROR,
+			)
 
 	@blockAction.when(blockAction.Context.MODAL_DIALOG_OPEN)
-	def popupSettingsDialog(self, dialog: Type[SettingsDialog], *args, **kwargs):
+	def popupSettingsDialog(self, dialog: type[SettingsDialog], *args, **kwargs):
 		self.prePopup()
 		try:
 			dialog(self, *args, **kwargs).Show()
@@ -256,7 +267,7 @@ class MainFrame(wx.Frame):
 
 	if NVDAState._allowDeprecatedAPI():
 
-		def _popupSettingsDialog(self, dialog: Type[SettingsDialog], *args, **kwargs):
+		def _popupSettingsDialog(self, dialog: type[SettingsDialog], *args, **kwargs):
 			log.warning(
 				"_popupSettingsDialog is deprecated, use popupSettingsDialog instead.",
 				stack_info=True,
@@ -289,7 +300,7 @@ class MainFrame(wx.Frame):
 					apiVersion=apiVersion,
 					backCompatTo=backCompatToAPIVersion,
 				)
-				runScriptModalDialog(confirmUpdateDialog)
+				runScriptModalDialog(confirmUpdateDialog, confirmUpdateDialog.callback)
 			else:
 				updateCheck.executePendingUpdate()
 
@@ -334,6 +345,9 @@ class MainFrame(wx.Frame):
 	def onAudioSettingsCommand(self, evt: wx.CommandEvent):
 		self.popupSettingsDialog(NVDASettingsDialog, AudioPanel)
 
+	def onVisionSettingsCommand(self, evt: wx.CommandEvent):
+		self.popupSettingsDialog(NVDASettingsDialog, VisionSettingsPanel)
+
 	def onKeyboardSettingsCommand(self, evt):
 		self.popupSettingsDialog(NVDASettingsDialog, KeyboardSettingsPanel)
 
@@ -358,8 +372,20 @@ class MainFrame(wx.Frame):
 	def onDocumentFormattingCommand(self, evt):
 		self.popupSettingsDialog(NVDASettingsDialog, DocumentFormattingPanel)
 
+	@blockAction.when(blockAction.Context.SECURE_MODE)
+	def onAddonStoreSettingsCommand(self, evt: wx.CommandEvent):
+		self.popupSettingsDialog(NVDASettingsDialog, AddonStorePanel)
+
 	def onUwpOcrCommand(self, evt):
 		self.popupSettingsDialog(NVDASettingsDialog, UwpOcrPanel)
+
+	@blockAction.when(blockAction.Context.SECURE_MODE)
+	def onRemoteAccessSettingsCommand(self, evt):
+		self.popupSettingsDialog(NVDASettingsDialog, RemoteSettingsPanel)
+
+	@blockAction.when(blockAction.Context.SECURE_MODE)
+	def onAdvancedSettingsCommand(self, evt: wx.CommandEvent):
+		self.popupSettingsDialog(NVDASettingsDialog, AdvancedPanel)
 
 	@blockAction.when(blockAction.Context.SECURE_MODE)
 	def onSpeechSymbolsCommand(self, evt):
@@ -369,9 +395,26 @@ class MainFrame(wx.Frame):
 	def onInputGesturesCommand(self, evt):
 		self.popupSettingsDialog(InputGesturesDialog)
 
-	def onAboutCommand(self, evt):
+	@staticmethod
+	def _copyVersionToClipboard(p: Payload):
+		versionStr = f"{versionInfo.version} ({versionInfo.version_detailed})"
+		api.copyToClip(versionStr)
+		# Translators: A message when the version number is copied to clipboard
+		# from the about dialog
+		ui.message(_("Copied to clipboard"))
+
+	def onAboutCommand(self, evt: wx.CommandEvent):
+		copyButton = Button(
+			id=wx.ID_COPY,
+			# Translators: The label for a button to copy the NVDA version number from the about dialog.
+			label=_("&Copy version number"),
+			callback=self._copyVersionToClipboard,
+			closesDialog=False,
+		)
 		# Translators: The title of the dialog to show about info for NVDA.
-		MessageDialog(None, versionInfo.aboutMessage, _("About NVDA")).Show()
+		aboutDialog = MessageDialog(None, versionInfo.aboutMessage, _("About NVDA"))
+		aboutDialog.addButton(copyButton)
+		aboutDialog.Show()
 
 	@blockAction.when(blockAction.Context.SECURE_MODE)
 	def onCheckForUpdateCommand(self, evt):
@@ -519,7 +562,7 @@ class MainFrame(wx.Frame):
 			helpId="RunCOMRegistrationFixingTool",
 		)
 		response: int = introDialog.ShowModal()
-		if response == wx.CANCEL:
+		if response != wx.OK:
 			log.debug("Run of COM Registration Fixing Tool canceled before UAC.")
 			return
 		progressDialog = IndeterminateProgressDialog(
@@ -584,7 +627,7 @@ class SysTrayIcon(wx.adv.TaskBarIcon):
 	def __init__(self, frame: MainFrame):
 		super(SysTrayIcon, self).__init__()
 		icon = wx.Icon(ICON_PATH, wx.BITMAP_TYPE_ICO)
-		self.SetIcon(icon, versionInfo.name)
+		self.SetIcon(icon, buildVersion.name)
 
 		self.menu = wx.Menu()
 		menu_preferences = self.preferencesMenu = wx.Menu()
@@ -794,32 +837,19 @@ class SysTrayIcon(wx.adv.TaskBarIcon):
 
 			# Translators: The label for the menu item to view the NVDA website
 			item = self.helpMenu.Append(wx.ID_ANY, _("NV Access &web site"))
-			self.Bind(wx.EVT_MENU, lambda evt: os.startfile(versionInfo.url), item)
+			self.Bind(wx.EVT_MENU, lambda evt: os.startfile(buildVersion.url), item)
 			# Translators: The label for the menu item to view the NVDA website's get help section
 			item = self.helpMenu.Append(wx.ID_ANY, _("&Help, training and support"))
-			self.Bind(wx.EVT_MENU, lambda evt: os.startfile(f"{versionInfo.url}/get-help/"), item)
+			self.Bind(wx.EVT_MENU, lambda evt: os.startfile(f"{buildVersion.url}/get-help/"), item)
 			# Translators: The label for the menu item to view the NVDA website's get help section
 			item = self.helpMenu.Append(wx.ID_ANY, _("NV Access &shop"))
-			self.Bind(wx.EVT_MENU, lambda evt: os.startfile(f"{versionInfo.url}/shop/"), item)
+			self.Bind(wx.EVT_MENU, lambda evt: os.startfile(f"{buildVersion.url}/shop/"), item)
 
 			self.helpMenu.AppendSeparator()
 
-			# Translators: The label for the menu item to view NVDA License document.
+			# Translators: The label for the menu item to view the NVDA License.
 			item = self.helpMenu.Append(wx.ID_ANY, _("L&icense"))
-			self.Bind(
-				wx.EVT_MENU,
-				lambda evt: systemUtils._displayTextFileWorkaround(getDocFilePath("copying.txt", False)),
-				item,
-			)
-			# Translators: The label for the menu item to view NVDA Contributors list document.
-			item = self.helpMenu.Append(wx.ID_ANY, _("C&ontributors"))
-			self.Bind(
-				wx.EVT_MENU,
-				lambda evt: systemUtils._displayTextFileWorkaround(getDocFilePath("contributors.txt", False)),
-				item,
-			)
-
-			self.helpMenu.AppendSeparator()
+			self.Bind(wx.EVT_MENU, lambda evt: displayLicense(), item)
 
 			# Translators: The label for the menu item to open NVDA Welcome Dialog.
 			item = self.helpMenu.Append(wx.ID_ANY, _("We&lcome dialog..."))
@@ -872,9 +902,16 @@ def initialize():
 
 	monkeyPatches.applyWxMonkeyPatches(mainFrame, winUser, wx)
 
+	# Set up GUI persistence
+	persistenceManager = wx.lib.agw.persist.PersistenceManager.Get()
+	persistenceManager.SetPersistenceFile(NVDAState.WritePaths.guiStateFile)
+	if not NVDAState.shouldWriteToDisk():
+		persistenceManager.DisableSaving()
+
 
 def terminate():
 	global mainFrame
+	wx.lib.agw.persist.PersistenceManager.Free()
 	mainFrame = None
 
 
@@ -954,7 +991,7 @@ def shouldConfigProfileTriggersBeSuspended():
 	Top-level windows that require this behavior should have a C{shouldSuspendConfigProfileTriggers} attribute set to C{True}.
 	Because these dialogs are often opened via the NVDA menu, this applies to the NVDA menu as well.
 	"""
-	if winUser.getGUIThreadInfo(ctypes.windll.kernel32.GetCurrentThreadId()).flags & 0x00000010:
+	if winUser.getGUIThreadInfo(winBindings.kernel32.GetCurrentThreadId()).flags & 0x00000010:
 		# The NVDA menu is active.
 		return True
 	for window in wx.GetTopLevelWindows():
